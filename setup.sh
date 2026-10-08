@@ -1,566 +1,982 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -euo pipefail
+set -Eeuo pipefail
+
+VERSION="2.0.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
-export DEBIAN_FRONTEND=noninteractive
-APT_OPTS="-o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+SCRIPT_NAME="uis"
+LOCKFILE="/run/uis.lock"
+LOG_FILE="/var/log/uis-$(date +%F_%H%M%S).log"
+TMP_DIR=""
+SSH_HARDENING_FILE="/etc/ssh/sshd_config.d/99-uis-hardening.conf"
+SYSCTL_FILE="/etc/sysctl.d/99-uis-hardening.conf"
+FAIL2BAN_FILE="/etc/fail2ban/jail.d/uis-sshd.conf"
+UFW_DEFAULTS_FILE="/etc/default/ufw"
+UFW_BEFORE_FILE="/etc/ufw/before.rules"
+SYSCTL_SERVICE="uis-sysctl.service"
+SYSCTL_HELPER="/usr/local/sbin/uis-apply-sysctl"
 
-LOG_FILE="/var/log/setup-$(date +%F_%H%M%S).log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+APT_OPTS=(
+  -o DPkg::Lock::Timeout=60
+  -o Dpkg::Options::=--force-confdef
+  -o Dpkg::Options::=--force-confold
+)
 
-LOCKFILE="/var/run/setup.lock"
-exec 200>"$LOCKFILE"
-flock -n 200 || { echo -e "${RED}[ERROR]${NC} Скрипт уже запущен."; exit 1; }
+log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_step() { echo -e "\n${BLUE}=== $* ===${NC}"; }
+
+on_error() {
+  local rc=$?
+  local line=${1:-unknown}
+  log_err "Ошибка на строке ${line} (exit ${rc})."
+  log_err "Лог: ${LOG_FILE}"
+  exit "$rc"
+}
+trap 'on_error $LINENO' ERR
 
 cleanup() {
-    rm -f /tmp/setup_*.tmp 2>/dev/null || true
+  if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
+    rm -rf -- "${TMP_DIR}"
+  fi
 }
 trap cleanup EXIT
 
-show_spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    while kill -0 "$pid" 2>/dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c] " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b"
-    done
-    printf "     \b\b\b\b\b"
+usage() {
+  cat <<USAGE
+UIS ${VERSION}
+
+Использование:
+  sudo bash setup.sh           # интерактивная установка
+  sudo bash setup.sh --audit   # только проверка, ничего не меняет
+  bash setup.sh --help
+USAGE
 }
+
+say_ok()   { printf '  [%bOK%b] %s\n' "$GREEN" "$NC" "$*"; }
+say_warn() { printf '  [%bWARN%b] %s\n' "$YELLOW" "$NC" "$*"; }
+say_fail() { printf '  [%bFAIL%b] %s\n' "$RED" "$NC" "$*"; }
 
 run_silent() {
-    local desc="$1"
-    shift
-    local log_file=$(mktemp)
+  local desc="$1"; shift
+  local log_file
+  log_file=$(mktemp)
+  echo -n -e "${GREEN}[INFO]${NC} ${desc}..."
 
-    echo -n -e "${GREEN}[INFO]${NC} ${desc}..."
-
-    "$@" > "$log_file" 2>&1 &
-    local pid=$!
-    show_spinner "$pid"
-
-    local exit_code=0
-    wait $pid || exit_code=$?
-
-    if [ $exit_code -eq 0 ]; then
-        echo -e "${GREEN}[OK]${NC}"
-        rm -f "$log_file"
-    else
-        echo -e "${RED}[FAIL]${NC}"
-        echo -e "${RED}Command failed with exit code $exit_code:${NC}"
-        cat "$log_file"
-        rm -f "$log_file"
-        exit $exit_code
-    fi
+  if "$@" >"$log_file" 2>&1; then
+    echo -e " ${GREEN}[OK]${NC}"
+    rm -f -- "$log_file"
+  else
+    local rc=$?
+    echo -e " ${RED}[FAIL]${NC}"
+    sed 's/^/  /' "$log_file" >&2 || true
+    rm -f -- "$log_file"
+    return "$rc"
+  fi
 }
 
-apply_sysctl() {
-    local key="$1"
-    local value="$2"
-    local file="${3:-/etc/sysctl.d/99-hardening.conf}"
-
-    if sysctl -w "$key=$value" >/dev/null 2>&1; then
-        if ! grep -qF "$key = $value" "$file" 2>/dev/null; then
-            echo "$key = $value" >> "$file"
-        fi
-        return 0
-    else
-        log_warn "Не удалось применить $key=$value (возможно, ограничение контейнера). Пропускаем."
-        return 0
-    fi
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    log_err "Для установки нужен root. Для аудита используйте sudo bash setup.sh --audit."
+    exit 1
+  fi
 }
 
-create_swap_file() {
-    local size="$1"
-    local size_num
-    size_num=$(echo "$size" | sed 's/[Gg]//')
-    local size_mb=$((size_num * 1024))
-
-    if [ -f /swapfile ]; then
-        swapoff /swapfile 2>/dev/null || true
-        rm -f /swapfile
-    fi
-
-    if ! fallocate -l "$size" /swapfile 2>/dev/null; then
-        dd if=/dev/zero of=/swapfile bs=1M count=$size_mb status=none
-    fi
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile
-}
-
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step() { echo -e "\n${YELLOW}=== $1 ===${NC}"; }
-
-if systemctl cat sshd.service &>/dev/null; then
-    SSH_SERVICE="sshd"
-else
-    SSH_SERVICE="ssh"
-fi
-
-safe_ssh_restart() {
-    if [ ! -d /run/sshd ]; then
-        mkdir -p /run/sshd
-        chmod 0755 /run/sshd
-    fi
-
-    log_info "Валидация конфигурации SSH (sshd -t)..."
-    if sshd -t; then
-        if systemctl is-active --quiet ssh.socket 2>/dev/null; then
-            systemctl daemon-reload
-            systemctl restart ssh.socket
-        fi
-        systemctl restart "$SSH_SERVICE"
-        log_info "Служба $SSH_SERVICE успешно перезапущена."
-    else
-        log_err "Конфигурация SSH содержит ошибки!"
-        log_err "Рестарт отменен во избежание потери доступа."
-        exit 1
-    fi
+setup_runtime() {
+  mkdir -p /var/log
+  TMP_DIR=$(mktemp -d /tmp/uis.XXXXXX)
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  exec 200>"$LOCKFILE"
+  flock -n 200 || { log_err "UIS уже запущен."; exit 1; }
 }
 
 backup_file() {
-    if [ -f "$1" ]; then
-        cp "$1" "$1.bak.$(date +%F_%H%M%S)"
-        log_info "Бэкап конфига: $1.bak..."
-    fi
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local backup="${file}.bak.$(date +%F_%H%M%S)"
+  cp -a -- "$file" "$backup"
+  log_info "Backup: $backup"
 }
 
-if [ "$(id -u)" -ne 0 ]; then
-    log_err "Пожалуйста запустите скрипт от имени root."
+write_atomic() {
+  local target="$1"
+  local mode="$2"
+  shift 2
+  local tmp="$TMP_DIR/$(basename "$target").tmp"
+  cat >"$tmp"
+  install -m "$mode" -o root -g root "$tmp" "$target"
+}
+
+unit_exists() { systemctl cat "$1" &>/dev/null; }
+
+normalize_os_version() {
+  local major=${OS_VERSION%%.*}
+  local rest=${OS_VERSION#*.}
+  local minor=${rest%%.*}
+  [[ "$rest" == "$OS_VERSION" ]] && minor=0
+  printf '%02d%02d' "$major" "$minor"
+}
+
+check_supported_os() {
+  if [[ ! -r /etc/os-release ]]; then
+    log_err "Не найден /etc/os-release."
     exit 1
-fi
+  fi
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  OS_ID="${ID:-unknown}"
+  OS_VERSION="${VERSION_ID:-0}"
+  OS_NAME="${PRETTY_NAME:-unknown}"
 
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="$ID"
-    OS_VERSION="$VERSION_ID"
-    OS_NAME="$PRETTY_NAME"
-else
-    OS_ID="unknown"
-    OS_VERSION="unknown"
-    OS_NAME="Unknown OS"
-fi
+  log_info "ОС: $OS_NAME"
 
-if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
-    log_warn "Обнаружена ОС: $OS_NAME"
-    log_warn "Скрипт разработан для Ubuntu/Debian. Продолжение на свой страх и риск."
-    read -p "Продолжить? (y/n): " os_confirm
-    if [[ ! "$os_confirm" =~ ^[Yy]$ ]]; then
-        log_err "Установка отменена."
+  case "$OS_ID" in
+    ubuntu)
+      local v
+      v=$(normalize_os_version)
+      if (( v < 2204 )); then
+        log_err "UIS ${VERSION} не предназначен для Ubuntu < 22.04."
+        log_err "Для нового сервера используйте Ubuntu 24.04 LTS."
         exit 1
-    fi
-else
-    log_info "Обнаружена ОС: $OS_NAME"
-fi
+      fi
+      ;;
+    debian)
+      local major="${OS_VERSION%%.*}"
+      if [[ ! "$major" =~ ^[0-9]+$ ]] || (( major < 12 )); then
+        log_err "UIS ${VERSION} не предназначен для Debian < 12."
+        exit 1
+      fi
+      ;;
+    *)
+      log_err "Неподдерживаемая ОС: $OS_NAME"
+      exit 1
+      ;;
+  esac
+}
 
-user_exists() { id "$1" &>/dev/null; }
+install_base_packages() {
+  log_step "1. Обновление системы"
+  export DEBIAN_FRONTEND=noninteractive
+  run_silent "apt update" apt-get "${APT_OPTS[@]}" update
+  run_silent "full-upgrade" apt-get "${APT_OPTS[@]}" full-upgrade -y
+  run_silent "autoremove" apt-get "${APT_OPTS[@]}" autoremove -y
+  unset DEBIAN_FRONTEND
 
-log_step "Шаг 1: Обновление системы"
-run_silent "Обновление списка пакетов" apt-get $APT_OPTS update -qq
-run_silent "Полное обновление системы" bash -c "apt-get $APT_OPTS full-upgrade -y && apt-get $APT_OPTS autoremove -y"
+  log_step "2. Базовые пакеты"
+  export DEBIAN_FRONTEND=noninteractive
+  run_silent "Установка базовых пакетов" apt-get "${APT_OPTS[@]}" install -y \
+    sudo openssh-server ufw fail2ban unattended-upgrades \
+    htop iotop ncdu tmux curl wget net-tools ca-certificates
+  unset DEBIAN_FRONTEND
+}
 
-if [ -f /var/run/reboot-required ]; then
-    log_warn "Обнаружено обновление ядра. Рекомендуется reboot после завершения скрипта."
-fi
-
-log_step "Шаг 1.1: Настройка автоматических обновлений"
-if ! dpkg -s unattended-upgrades &>/dev/null; then
-    apt-get $APT_OPTS install -y unattended-upgrades
-fi
-
-if ! grep -q "APT::Periodic::Unattended-Upgrade" /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
-    cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+configure_unattended_upgrades() {
+  log_step "3. Автоматические обновления"
+  write_atomic /etc/apt/apt.conf.d/20auto-upgrades 644 <<'EOF2'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
-EOF
-    dpkg-reconfigure -f noninteractive unattended-upgrades
-    log_info "Автообновления безопасности включены."
-else
-    log_info "Уже настроено."
-fi
+EOF2
+  log_info "Unattended upgrades включены ежедневно."
+}
 
-log_step "Шаг 2: Установка UFW и Fail2Ban"
-run_silent "Установка пакетов безопасности" apt-get $APT_OPTS install -y ufw fail2ban
-
-log_step "Шаг 3: Создание пользователя"
-new_user=""
-while [[ -z "$new_user" ]]; do
-    read -p "Введите имя нового пользователя: " new_user
-    if [[ -z "$new_user" ]]; then
-        log_warn "Имя не может быть пустым."
-        continue
+create_or_select_user() {
+  log_step "4. Пользователь sudo"
+  local user=""
+  while :; do
+    read -r -p "Имя пользователя [nrpems]: " user
+    user=${user:-nrpems}
+    if [[ ! "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+      log_warn "Некорректное имя пользователя."
+      continue
     fi
-    if [[ ! "$new_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-        log_warn "Некорректное имя (только a-z, 0-9, _, -). Первый символ — буква или _."
-        new_user=""
-        continue
-    fi
-    if [[ "$new_user" == "root" ]]; then
-        log_warn "Нельзя использовать 'root' как имя пользователя."
-        new_user=""
-        continue
-    fi
-done
+    [[ "$user" == root ]] && { log_warn "root использовать нельзя."; continue; }
+    break
+  done
 
-if ! user_exists "$new_user"; then
-    log_info "Создание пользователя $new_user..."
-    log_warn "Вам будет предложено ввести пароль для нового пользователя. Придумайте надёжный пароль — это будет единственный способ входа."
-    adduser --gecos "" "$new_user"
-    usermod -aG sudo "$new_user"
-    log_info "Пользователь $new_user успешно создан."
-else
-    log_info "Пользователь $new_user уже существует."
-fi
+  if id "$user" &>/dev/null; then
+    log_info "Пользователь $user уже существует."
+  else
+    log_warn "Введите пароль для $user."
+    adduser --gecos "" "$user"
+  fi
+  usermod -aG sudo "$user"
+  TARGET_USER="$user"
+  log_info "$TARGET_USER состоит в sudo."
+}
 
-log_step "Шаг 5: Смена порта SSH"
-os_version="${OS_VERSION:-0}"
-sshport=""
+get_current_ssh_port() {
+  local p
+  p=$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}') || true
+  if [[ "$p" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$p"
+  else
+    printf '22'
+  fi
+}
 
-while true; do
-    read -p "Новый порт SSH (1024-65535): " sshport
-    if [[ ! "$sshport" =~ ^[0-9]+$ ]] || [ "$sshport" -le 1023 ] || [ "$sshport" -ge 65536 ]; then
-        log_warn "Некорректный порт. Допустимый диапазон: 1024-65535."
-        continue
+choose_ssh_port() {
+  log_step "5. SSH порт"
+  local current_port
+  current_port=$(get_current_ssh_port)
+  log_info "Текущий SSH порт: $current_port"
+
+  while :; do
+    read -r -p "Новый SSH порт [1234]: " SSH_PORT
+    SSH_PORT=${SSH_PORT:-1234}
+    if [[ ! "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1024 || SSH_PORT > 65535 )); then
+      log_warn "Используйте порт 1024-65535."
+      continue
     fi
-    if ss -tlnp 2>/dev/null | grep -v "sshd" | grep -q ":$sshport "; then
-        log_warn "Порт $sshport уже занят другим сервисом!"
+    if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq ":${SSH_PORT}$|\.${SSH_PORT}$"; then
+      if [[ "$SSH_PORT" != "$current_port" ]]; then
+        log_warn "Порт $SSH_PORT уже занят."
         continue
+      fi
     fi
     break
-done
+  done
+  log_info "Новый SSH порт: $SSH_PORT"
+}
 
-echo ""
-echo "========================================================"
-log_info "ПРЕДВАРИТЕЛЬНАЯ СВОДКА"
-echo "--------------------------------------------------------"
-echo -e "ОС:            ${YELLOW}${OS_NAME}${NC}"
-echo -e "Пользователь:  ${YELLOW}${new_user}${NC}"
-echo -e "Вход:          ${YELLOW}по паролю${NC}"
-echo -e "SSH порт:      ${YELLOW}${sshport}${NC}"
-echo "--------------------------------------------------------"
-echo -e "Будут выполнены:"
-echo -e "  • Настройка UFW (default deny) + rate-limit SSH"
-echo -e "  • Смена SSH порта и hardening (вход только по паролю, без root)"
-echo -e "  • Настройка Fail2Ban (усиленные лимиты под парольный вход)"
-echo -e "  • Блокировка ICMP (ping)"
-echo -e "  • Опционально: IPv6, Swap, BBR, Docker, Chrony"
-echo -e "  • Отключение root-доступа"
-echo "========================================================"
-read -p "Продолжить настройку? (y/n, default: y): " start_confirm
-start_confirm=${start_confirm:-y}
-if [[ ! "$start_confirm" =~ ^[Yy]$ ]]; then
-    log_err "Установка отменена пользователем."
-    exit 0
-fi
+show_plan() {
+  echo
+  echo "============================================================"
+  log_info "ПРЕДВАРИТЕЛЬНАЯ СВОДКА"
+  echo "------------------------------------------------------------"
+  printf 'ОС:             %s\n' "$OS_NAME"
+  printf 'Пользователь:   %s\n' "$TARGET_USER"
+  printf 'SSH порт:       %s\n' "$SSH_PORT"
+  printf 'SSH auth:       пароль + public key\n'
+  printf 'IPv6:            %s\n' "$([[ "$DISABLE_IPV6" =~ ^[Yy]$ ]] && echo 'отключить' || echo 'оставить')"
+  printf 'Swap:            %s\n' "$([[ "$CREATE_SWAP" =~ ^[Yy]$ ]] && echo '2G при отсутствии' || echo 'не создавать')"
+  printf 'BBR:             %s\n' "$([[ "$ENABLE_BBR" =~ ^[Yy]$ ]] && echo 'включить' || echo 'не менять')"
+  printf 'Docker:          %s\n' "$([[ "$INSTALL_DOCKER" =~ ^[Yy]$ ]] && echo 'установить' || echo 'не устанавливать')"
+  printf 'Chrony:          %s\n' "$([[ "$INSTALL_CHRONY" =~ ^[Yy]$ ]] && echo 'установить' || echo 'не устанавливать')"
+  echo "------------------------------------------------------------"
+  echo "Будет настроено: UFW, SSH hardening, Fail2Ban, ICMP DROP"
+  echo "и проверяемый sysctl. Root будет заблокирован только после"
+  echo "проверки второй SSH-сессии."
+  echo "============================================================"
+}
 
-log_step "Шаг 5.1: Настройка UFW"
+ask_options() {
+  read -r -p "Отключить IPv6? (y/n, default y): " DISABLE_IPV6
+  DISABLE_IPV6=${DISABLE_IPV6:-y}
+  read -r -p "Создать Swap 2G, если его нет? (y/n, default y): " CREATE_SWAP
+  CREATE_SWAP=${CREATE_SWAP:-y}
+  read -r -p "Включить TCP BBR? (y/n, default y): " ENABLE_BBR
+  ENABLE_BBR=${ENABLE_BBR:-y}
+  read -r -p "Установить Docker? (y/n, default n): " INSTALL_DOCKER
+  INSTALL_DOCKER=${INSTALL_DOCKER:-n}
+  read -r -p "Установить Chrony? (y/n, default y): " INSTALL_CHRONY
+  INSTALL_CHRONY=${INSTALL_CHRONY:-y}
+  read -r -p "Изменить hostname? (ENTER = оставить): " NEW_HOSTNAME
+  read -r -p "Изменить timezone? (например Europe/Moscow, ENTER = оставить): " NEW_TIMEZONE
+}
 
-ufw default deny incoming >/dev/null 2>&1
-ufw default allow outgoing >/dev/null 2>&1
-log_info "UFW: default deny incoming, allow outgoing."
+configure_ufw() {
+  log_step "6. UFW"
+  ufw default deny incoming >/dev/null
+  ufw default allow outgoing >/dev/null
 
-if ! ufw status 2>/dev/null | grep -q "$sshport/tcp"; then
-    ufw limit "$sshport"/tcp
-    log_info "Порт $sshport/tcp разрешен (rate-limited)."
-fi
+  if ! ufw status 2>/dev/null | grep -Eq "${SSH_PORT}/tcp[[:space:]]+LIMIT"; then
+    ufw delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
+    ufw delete "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
+    ufw limit "${SSH_PORT}/tcp" >/dev/null
+  fi
 
-if [[ $(ufw status 2>/dev/null | head -n1) == "Status: inactive" ]]; then
-    echo "y" | ufw enable
-    log_info "UFW активирован."
-fi
+  if [[ "$(ufw status | head -n1)" == "Status: inactive" ]]; then
+    echo 'y' | ufw enable >/dev/null
+  fi
 
-log_step "Шаг 5.2: Применение нового порта SSH"
-backup_file "/etc/ssh/sshd_config"
+  log_info "UFW активен: deny incoming / allow outgoing / rate-limit SSH."
+}
 
-os_version_num=$(echo "$os_version" | awk -F. '{printf "%d%02d", $1, $2}')
-if [[ "$os_version" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$os_version_num" -ge 2210 ]; then
-    mkdir -p /etc/systemd/system/ssh.socket.d
-    OVERRIDE_FILE="/etc/systemd/system/ssh.socket.d/override.conf"
+configure_ssh() {
+  log_step "7. SSH hardening"
+  mkdir -p /etc/ssh/sshd_config.d
+  backup_file "$SSH_HARDENING_FILE"
 
-    cat > "$OVERRIDE_FILE" <<EOF
-[Socket]
-ListenStream=
-ListenStream=0.0.0.0:$sshport
-Accept=no
-FreeBind=yes
-EOF
-    log_info "Systemd Override применен (Port $sshport, IPv4)."
-else
-    if ! grep -q "^Port $sshport" /etc/ssh/sshd_config; then
-        sed -i "s/^#Port 22/Port $sshport/" /etc/ssh/sshd_config
-        sed -i "s/^Port 22/Port $sshport/" /etc/ssh/sshd_config
-        if ! grep -q "^Port " /etc/ssh/sshd_config; then
-            echo "Port $sshport" >> /etc/ssh/sshd_config
-        fi
-        log_info "sshd_config обновлен (Port $sshport)."
-    fi
-fi
+  if [[ -f /etc/systemd/system/ssh.socket.d/override.conf ]] && grep -q 'ListenStream=0.0.0.0:' /etc/systemd/system/ssh.socket.d/override.conf 2>/dev/null; then
+    backup_file /etc/systemd/system/ssh.socket.d/override.conf
+    rm -f /etc/systemd/system/ssh.socket.d/override.conf
+    systemctl daemon-reload
+  fi
 
-safe_ssh_restart
+  local ssh_address_family
+  if [[ "$DISABLE_IPV6" =~ ^[Yy]$ ]]; then
+    ssh_address_family="inet"
+  else
+    ssh_address_family="any"
+  fi
 
-log_step "Шаг 6: Настройка безопасности SSH"
-
-if [ -f "/etc/ssh/sshd_config.d/50-cloud-init.conf" ]; then
-    echo "PasswordAuthentication yes" > "/etc/ssh/sshd_config.d/50-cloud-init.conf"
-fi
-
-CONFIG_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
-cat > "$CONFIG_FILE" <<EOF
+  write_atomic "$SSH_HARDENING_FILE" 644 <<EOF2
+# Managed by UIS ${VERSION}
+Port ${SSH_PORT}
 PermitRootLogin no
 PasswordAuthentication yes
-ChallengeResponseAuthentication no
-KbdInteractiveAuthentication no
 PubkeyAuthentication yes
-AddressFamily inet
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitEmptyPasswords no
 MaxAuthTries 3
 LoginGraceTime 30
+AllowUsers ${TARGET_USER}
+AddressFamily ${ssh_address_family}
 X11Forwarding no
-AllowUsers $new_user
+AllowAgentForwarding no
+PermitTunnel no
 ClientAliveInterval 300
 ClientAliveCountMax 2
 LogLevel VERBOSE
 UseDNS no
-PermitEmptyPasswords no
-EOF
+EOF2
 
-log_info "Конфигурация безопасности применена (вход по паролю разрешен только для $new_user, root запрещен)."
-safe_ssh_restart
+  if ! sshd -t; then
+    log_err "sshd -t провалился. Старый SSH-конфиг не должен быть потерян."
+    exit 1
+  fi
 
-log_step "Шаг 7: Настройка ICMP"
-UFW_RULES="/etc/ufw/before.rules"
-backup_file "$UFW_RULES"
+  if unit_exists ssh.socket; then
+    systemctl daemon-reload
+    if systemctl is-active --quiet ssh.socket; then
+      systemctl restart ssh.socket
+    else
+      systemctl stop ssh.service >/dev/null 2>&1 || true
+      systemctl enable --now ssh.socket >/dev/null
+    fi
+  else
+    systemctl restart ssh.service
+  fi
 
-if grep -q "icmp-type echo-request -j ACCEPT" "$UFW_RULES"; then
-    sed -i 's/-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT/-A ufw-before-input -p icmp --icmp-type echo-request -j DROP/g' "$UFW_RULES"
-    ufw reload
-    log_info "ICMP Echo Request: DROP (Сервер скрыт от пинга)."
-elif grep -q "icmp-type echo-request -j DROP" "$UFW_RULES"; then
-    log_info "Ping уже отключен."
-else
-    log_warn "Правило ICMP не найдено автоматически. Проверьте $UFW_RULES."
+  local effective_port effective_user root_login
+  effective_port=$(sshd -T | awk '$1=="port" {print $2; exit}')
+  effective_user=$(sshd -T | awk '$1=="allowusers" {$1=""; sub(/^ /,""); print; exit}')
+  root_login=$(sshd -T | awk '$1=="permitrootlogin" {print $2; exit}')
+
+  [[ "$effective_port" == "$SSH_PORT" ]] || { log_err "sshd слушает не тот порт: $effective_port"; exit 1; }
+  [[ "$effective_user" == "$TARGET_USER" ]] || { log_err "AllowUsers не совпадает: $effective_user"; exit 1; }
+  [[ "$root_login" == "no" ]] || { log_err "PermitRootLogin не установлен в no."; exit 1; }
+
+  log_info "SSH hardening применён и проверен."
+}
+
+configure_icmp() {
+  log_step "8. ICMP"
+  backup_file "$UFW_BEFORE_FILE"
+
+  if grep -qE '^-A ufw-before-input -p icmp --icmp-type echo-request -j DROP$' "$UFW_BEFORE_FILE"; then
+    log_info "ICMP echo-request уже блокируется."
+    return
+  fi
+
+  if grep -qE '^-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT$' "$UFW_BEFORE_FILE"; then
+    sed -i 's/^-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT$/-A ufw-before-input -p icmp --icmp-type echo-request -j DROP/' "$UFW_BEFORE_FILE"
+  else
+    sed -i '/^-A ufw-user-input /i -A ufw-before-input -p icmp --icmp-type echo-request -j DROP' "$UFW_BEFORE_FILE"
+  fi
+  ufw reload >/dev/null
+  log_info "IPv4 ICMP echo-request: DROP."
+}
+
+configure_ipv6() {
+  log_step "9. IPv6 hardening"
+  backup_file "$UFW_DEFAULTS_FILE"
+
+  if [[ "$DISABLE_IPV6" =~ ^[Yy]$ ]]; then
+    if grep -q '^IPV6=' "$UFW_DEFAULTS_FILE"; then
+      sed -i 's/^IPV6=.*/IPV6=no/' "$UFW_DEFAULTS_FILE"
+    else
+      printf '\nIPV6=no\n' >> "$UFW_DEFAULTS_FILE"
+    fi
+    ufw reload >/dev/null 2>&1 || true
+    log_info "UFW IPv6 support disabled (IPV6=no)."
+  else
+    if grep -q '^IPV6=' "$UFW_DEFAULTS_FILE"; then
+      sed -i 's/^IPV6=.*/IPV6=yes/' "$UFW_DEFAULTS_FILE"
+    else
+      printf '\nIPV6=yes\n' >> "$UFW_DEFAULTS_FILE"
+    fi
+  fi
+}
+
+write_sysctl_config() {
+  log_step "10. Kernel / sysctl hardening"
+  backup_file "$SYSCTL_FILE"
+
+  if [[ "$DISABLE_IPV6" =~ ^[Yy]$ ]]; then
+    IPV6_LINES=$(cat <<'EOF2'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF2
+)
+  else
+    IPV6_LINES="# IPv6 left enabled"
+  fi
+
+  write_atomic "$SYSCTL_FILE" 644 <<EOF2
+# Managed by UIS ${VERSION}
+${IPV6_LINES}
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.tcp_syncookies = 1
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.yama.ptrace_scope = 1
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.suid_dumpable = 0
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+EOF2
+
+  if [[ "$ENABLE_BBR" =~ ^[Yy]$ ]]; then
+    cat >> "$SYSCTL_FILE" <<'EOF2'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF2
+  fi
+
+  sysctl --system >/dev/null 2>&1 || true
+
+  install_sysctl_reapply_service
+  log_info "Sysctl hardening применён; post-network verification service enabled."
+}
+
+install_sysctl_reapply_service() {
+  log_info "Устанавливаю post-network reapply service для детерминированного runtime state."
+
+  write_atomic "$SYSCTL_HELPER" 755 <<'EOF2'
+#!/usr/bin/env bash
+set -u
+
+/usr/sbin/sysctl --load=/etc/sysctl.d/99-uis-hardening.conf >/dev/null 2>&1 || true
+
+if grep -q '^IPV6=no$' /etc/default/ufw 2>/dev/null; then
+  for file in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [[ -w "$file" ]] || continue
+    echo 1 > "$file"
+  done
 fi
+EOF2
 
-log_step "Шаг 7.1: Настройка Fail2Ban"
-JAIL_FILE="/etc/fail2ban/jail.d/ssh-hardening.conf"
-if ! grep -qF "port = $sshport" "$JAIL_FILE" 2>/dev/null; then
-    mkdir -p /etc/fail2ban/jail.d
-    cat > "$JAIL_FILE" <<EOF
+  cat > "/etc/systemd/system/${SYSCTL_SERVICE}" <<EOF2
+[Unit]
+Description=UIS kernel hardening re-apply after network initialization
+Wants=network-online.target
+After=network-online.target systemd-sysctl.service
+
+[Service]
+Type=oneshot
+ExecStart=${SYSCTL_HELPER}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+  chmod 644 "/etc/systemd/system/${SYSCTL_SERVICE}"
+  systemctl daemon-reload
+  systemctl enable "$SYSCTL_SERVICE" >/dev/null
+  systemctl start "$SYSCTL_SERVICE"
+}
+
+configure_fail2ban() {
+  log_step "11. Fail2Ban"
+  mkdir -p /etc/fail2ban/jail.d
+  backup_file "$FAIL2BAN_FILE"
+
+  write_atomic "$FAIL2BAN_FILE" 644 <<EOF2
 [DEFAULT]
 bantime = 24h
 findtime = 10m
 maxretry = 3
 backend = systemd
+
 [sshd]
 enabled = true
-port = $sshport
-EOF
-    systemctl restart fail2ban
-    log_info "Jail для SSH настроен ($JAIL_FILE): maxretry=3, bantime=24h (усилено под парольный вход)."
-fi
+port = ${SSH_PORT}
+EOF2
 
-log_step "Шаг 7.2: Настройка Sysctl"
-read -p "Отключить IPv6? (y/n, default: y): " disable_ipv6
-disable_ipv6=${disable_ipv6:-y}
+  fail2ban-client -t >/dev/null
+  systemctl enable --now fail2ban >/dev/null
+  log_info "Fail2Ban: sshd / 3 attempts / 10m / 24h."
+}
 
-if [[ "$disable_ipv6" =~ ^[Yy]$ ]]; then
-    SYSCTL_FILE="/etc/sysctl.d/99-hardening.conf"
-    if ! grep -q "net.ipv6.conf.all.disable_ipv6 = 1" "$SYSCTL_FILE" 2>/dev/null; then
+configure_swap() {
+  [[ "$CREATE_SWAP" =~ ^[Yy]$ ]] || return 0
+  log_step "12. Swap"
 
-        apply_sysctl "net.ipv6.conf.all.disable_ipv6" "1"
-        apply_sysctl "net.ipv6.conf.default.disable_ipv6" "1"
-        apply_sysctl "net.ipv6.conf.lo.disable_ipv6" "1"
-        apply_sysctl "net.ipv4.conf.all.rp_filter" "1"
-        apply_sysctl "net.ipv4.conf.default.rp_filter" "1"
-        apply_sysctl "net.ipv4.tcp_syncookies" "1"
-        apply_sysctl "net.ipv4.conf.all.accept_redirects" "0"
-        apply_sysctl "net.ipv4.conf.default.accept_redirects" "0"
-        apply_sysctl "net.ipv4.conf.all.send_redirects" "0"
-        apply_sysctl "net.ipv4.icmp_ignore_bogus_error_responses" "1"
-        apply_sysctl "net.ipv4.conf.all.log_martians" "1"
-
-        sysctl --system > /dev/null 2>&1 || true
-        log_info "Параметры безопасности применены (где возможно)."
-    fi
-else
-    log_info "Отключение IPv6 пропущено пользователем."
-fi
-
-log_step "Шаг 8: Настройка Swap"
-if ! swapon --show 2>/dev/null | grep -q "partition\|file"; then
-    read -p "Создать Swap файл? (y/n, default: y): " create_swap
-    create_swap=${create_swap:-y}
-
-    if [[ "$create_swap" =~ ^[Yy]$ ]]; then
-        SWAP_SIZE="2G"
-
-        avail_mb=$(df -BM / | tail -1 | awk '{print $4}' | sed 's/M//')
-        if [ "$avail_mb" -lt 2560 ]; then
-            log_warn "Недостаточно места на диске (${avail_mb}MB свободно). Swap не создан."
-        elif run_silent "Создание файла Swap ($SWAP_SIZE)" create_swap_file "$SWAP_SIZE"; then
-            if ! grep -qF '/swapfile' /etc/fstab; then
-                echo '/swapfile none swap sw 0 0' >> /etc/fstab
-            fi
-
-            apply_sysctl "vm.swappiness" "10"
-            apply_sysctl "vm.vfs_cache_pressure" "50"
-
-            log_info "Swap ($SWAP_SIZE) создан и настроен."
-        else
-            log_err "Не удалось создать Swap."
-        fi
-    fi
-else
+  if swapon --show | awk 'NR>1 {print $1}' | grep -q .; then
     log_info "Swap уже активен."
-fi
+    return
+  fi
 
-log_step "Шаг 9: Включение TCP BBR"
-read -p "Включить TCP BBR? (y/n, default: y): " enable_bbr
-enable_bbr=${enable_bbr:-y}
+  local free_mb
+  free_mb=$(df -BM / | awk 'NR==2 {gsub("M","",$4); print $4}')
+  if (( free_mb < 2560 )); then
+    log_warn "Недостаточно свободного места для 2G swap: ${free_mb}M."
+    return
+  fi
 
-if [[ "$enable_bbr" =~ ^[Yy]$ ]]; then
-    if ! grep -q "tcp_congestion_control = bbr" /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null; then
-        apply_sysctl "net.core.default_qdisc" "fq"
-        apply_sysctl "net.ipv4.tcp_congestion_control" "bbr"
-        sysctl --system > /dev/null 2>&1 || true
-        log_info "TCP BBR включен (где возможно)."
+  if ! fallocate -l 2G /swapfile 2>/dev/null; then
+    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+  fi
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -qF '/swapfile none swap sw 0 0' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  sysctl -w vm.swappiness=10 >/dev/null
+  sysctl -w vm.vfs_cache_pressure=50 >/dev/null
+  grep -qF 'vm.swappiness = 10' "$SYSCTL_FILE" || echo 'vm.swappiness = 10' >> "$SYSCTL_FILE"
+  grep -qF 'vm.vfs_cache_pressure = 50' "$SYSCTL_FILE" || echo 'vm.vfs_cache_pressure = 50' >> "$SYSCTL_FILE"
+  log_info "Swap 2G создан."
+}
+
+configure_bbr() {
+  [[ "$ENABLE_BBR" =~ ^[Yy]$ ]] || return 0
+  log_step "13. BBR"
+
+  if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx bbr; then
+    modprobe tcp_bbr 2>/dev/null || true
+  fi
+
+  local available
+  available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  if ! grep -qw bbr <<<"$available"; then
+    log_warn "BBR недоступен в этом kernel."
+    return 0
+  fi
+
+  sysctl -w net.core.default_qdisc=fq >/dev/null
+  sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
+  grep -qF 'net.core.default_qdisc = fq' "$SYSCTL_FILE" || echo 'net.core.default_qdisc = fq' >> "$SYSCTL_FILE"
+  grep -qF 'net.ipv4.tcp_congestion_control = bbr' "$SYSCTL_FILE" || echo 'net.ipv4.tcp_congestion_control = bbr' >> "$SYSCTL_FILE"
+  log_info "BBR включён."
+}
+
+configure_chrony() {
+  [[ "$INSTALL_CHRONY" =~ ^[Yy]$ ]] || return 0
+  log_step "14. Chrony"
+  export DEBIAN_FRONTEND=noninteractive
+  run_silent "Установка Chrony" apt-get "${APT_OPTS[@]}" install -y chrony
+  unset DEBIAN_FRONTEND
+  systemctl enable --now chrony >/dev/null
+  log_info "Chrony включён."
+}
+
+configure_docker() {
+  [[ "$INSTALL_DOCKER" =~ ^[Yy]$ ]] || return 0
+  log_step "15. Docker"
+  if command -v docker >/dev/null 2>&1; then
+    usermod -aG docker "$TARGET_USER"
+    log_warn "Docker уже установлен. $TARGET_USER добавлен в группу docker."
+    return
+  fi
+
+  curl -fsSL https://get.docker.com -o "$TMP_DIR/get-docker.sh"
+  sh "$TMP_DIR/get-docker.sh"
+  usermod -aG docker "$TARGET_USER"
+  log_warn "Docker установлен. Публикация контейнерных портов может обходить UFW."
+  log_warn "Для внешних сервисов явно настройте firewall/DOCKER-USER или bind на 127.0.0.1."
+}
+
+configure_host() {
+  log_step "16. Hostname / timezone"
+  if [[ -n "${NEW_HOSTNAME}" ]]; then
+    if [[ "$NEW_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]]; then
+      hostnamectl set-hostname "$NEW_HOSTNAME"
+      log_info "Hostname: $NEW_HOSTNAME"
     else
-        log_info "BBR уже включен."
+      log_warn "Hostname пропущен: некорректный формат."
     fi
-fi
+  fi
 
-log_step "Шаг 10: Установка дополнительного ПО"
-
-BASE_UTILS="htop iotop ncdu tmux curl wget net-tools"
-MISSING_UTILS=""
-for util in $BASE_UTILS; do
-    if ! dpkg -s "$util" &>/dev/null; then
-        MISSING_UTILS="$MISSING_UTILS $util"
-    fi
-done
-if [ -n "$MISSING_UTILS" ]; then
-    run_silent "Установка базовых утилит" apt-get $APT_OPTS install -y $MISSING_UTILS
-    log_info "Установлены утилиты:$MISSING_UTILS"
-else
-    log_info "Базовые утилиты уже установлены."
-fi
-
-read -p "Установить Docker? (y/n, default: n): " install_docker
-install_docker=${install_docker:-n}
-
-if [[ "$install_docker" =~ ^[Yy]$ ]]; then
-    log_info "Установка Docker..."
-    if command -v docker &> /dev/null; then
-        log_warn "Docker уже установлен."
+  if [[ -n "${NEW_TIMEZONE}" ]]; then
+    if timedatectl list-timezones | grep -Fxq "$NEW_TIMEZONE"; then
+      timedatectl set-timezone "$NEW_TIMEZONE"
+      log_info "Timezone: $NEW_TIMEZONE"
     else
-        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-        run_silent "Установка Docker" sh /tmp/get-docker.sh
-        rm -f /tmp/get-docker.sh
-        usermod -aG docker "$new_user"
-        log_info "Пользователь $new_user добавлен в группу docker."
-        log_warn "ВНИМАНИЕ: Docker модифицирует iptables напрямую, минуя UFW."
-        log_warn "Порты контейнеров (-p) будут открыты снаружи несмотря на UFW."
-        log_warn "Для защиты используйте: 127.0.0.1:PORT:PORT вместо PORT:PORT."
+      log_warn "Timezone '$NEW_TIMEZONE' не существует."
     fi
-fi
+  fi
+}
 
-read -p "Установить NTP (Chrony) для синхронизации времени? (y/n, default: y): " install_ntp
-install_ntp=${install_ntp:-y}
+configure_optional_services() {
+  log_step "17. Ненужные сервисы"
 
-if [[ "$install_ntp" =~ ^[Yy]$ ]]; then
-    run_silent "Установка Chrony" apt-get $APT_OPTS install -y chrony
-    systemctl enable chrony > /dev/null 2>&1
-    systemctl start chrony > /dev/null 2>&1
-    log_info "Chrony установлен и запущен."
-fi
+  for unit in snapd.service snapd.socket; do
+    if unit_exists "$unit"; then
+      systemctl disable --now "$unit" 2>/dev/null || true
+    fi
+  done
 
-log_step "Шаг 10.3: Настройка hostname"
-current_hostname=$(hostname)
-log_info "Текущий hostname: $current_hostname"
-read -p "Изменить hostname? (введите новый или нажмите ENTER для пропуска): " new_hostname
-if [[ -n "$new_hostname" ]]; then
-    hostnamectl set-hostname "$new_hostname"
-    log_info "Hostname изменен на: $new_hostname"
-else
-    log_info "Hostname оставлен без изменений."
-fi
+  for unit in cups.service; do
+    if unit_exists "$unit"; then
+      systemctl disable --now "$unit" 2>/dev/null || true
+    fi
+  done
 
-log_step "Шаг 10.4: Настройка часового пояса"
-current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "неизвестно")
-log_info "Текущий часовой пояс: $current_tz"
-read -p "Изменить часовой пояс? (например, Europe/Moscow, или ENTER для пропуска): " new_tz
-if [[ -n "$new_tz" ]]; then
-    if timedatectl set-timezone "$new_tz" 2>/dev/null; then
-        log_info "Часовой пояс установлен: $new_tz"
+  log_info "snapd/cups: отключены, где присутствуют."
+}
+
+validate_access_before_root_lock() {
+  log_step "18. Проверка доступа"
+  local listening
+  listening=$(ss -H -lnt | awk '{print $4}' | grep -E "(:|\\.)${SSH_PORT}$" || true)
+  if [[ -z "$listening" ]]; then
+    log_err "Новый SSH порт $SSH_PORT не слушается. Root не будет блокироваться."
+    exit 1
+  fi
+
+  if ! sshd -t; then
+    log_err "sshd -t не проходит. Root не будет блокироваться."
+    exit 1
+  fi
+
+  echo
+  echo "============================================================"
+  log_warn "НЕ ЗАКРЫВАЙТЕ ТЕКУЩУЮ СЕССИЮ."
+  echo "Откройте вторую SSH-сессию и проверьте:"
+  echo "  ssh -p ${SSH_PORT} ${TARGET_USER}@<IP>"
+  echo "  sudo whoami     # должно вывести root"
+  echo "============================================================"
+  read -r -p "Вторая SSH-сессия успешно работает? (yes/no): " ACCESS_OK
+  if [[ "$ACCESS_OK" != "yes" ]]; then
+    log_warn "Root оставлен разблокированным. Сначала исправьте доступ."
+    return 1
+  fi
+  return 0
+}
+
+lock_root() {
+  log_step "19. Блокировка root account"
+  local status
+  status=$(passwd -S root 2>/dev/null | awk '{print $2}')
+  if [[ "$status" == "L" ]]; then
+    log_info "root уже locked."
+  else
+    passwd -l root >/dev/null
+    log_info "root account locked."
+  fi
+}
+
+cleanup_old_ssh_ufw_rule() {
+  local old_port="$1"
+  [[ -n "$old_port" && "$old_port" =~ ^[0-9]+$ ]] || return 0
+  [[ "$old_port" == "$SSH_PORT" ]] && return 0
+
+  if ufw status | grep -Eq "${old_port}/tcp.*ALLOW|${old_port}/tcp.*LIMIT"; then
+    log_warn "Найден старый UFW SSH rule на $old_port. Он НЕ удаляется автоматически."
+    log_warn "После дополнительной проверки можно удалить: sudo ufw delete limit ${old_port}/tcp"
+  fi
+}
+
+create_logrotate() {
+  cat > /etc/logrotate.d/uis <<'EOF2'
+/var/log/uis-*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+EOF2
+  chmod 644 /etc/logrotate.d/uis
+}
+
+post_setup_checks() {
+  log_step "20. Финальная проверка"
+  run_audit || true
+}
+
+check_line() {
+  local label="$1" expected="$2" actual="$3" level="${4:-FAIL}"
+  if [[ "$actual" == "$expected" ]]; then
+    say_ok "$label"
+    return 0
+  fi
+  if [[ "$level" == WARN ]]; then
+    say_warn "$label (ожидалось: '$expected', фактически: '$actual')"
+    return 0
+  fi
+  say_fail "$label (ожидалось: '$expected', фактически: '$actual')"
+  return 1
+}
+
+run_audit() {
+  local fail=0
+  local warn=0
+  local port root_locked
+  port=$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}' || true)
+
+  echo
+  echo "============================================================"
+  echo "UIS ${VERSION} AUDIT"
+  echo "============================================================"
+  echo "Hostname: $(hostname)"
+  echo "OS:       ${PRETTY_NAME:-unknown}"
+  echo
+
+  if sshd -t 2>/dev/null; then say_ok "sshd -t"; else say_fail "sshd -t"; fail=$((fail + 1)); fi
+  if [[ "$port" =~ ^[0-9]+$ ]] && ss -H -lnt | awk '{print $4}' | grep -Eq "(:|\\.)${port}$"; then
+    say_ok "SSH listening on ${port}"
+  else
+    say_fail "SSH listening on configured port ${port:-unknown}"; fail=$((fail + 1))
+  fi
+
+  local permit_root password_auth allow_users address_family
+  permit_root=$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin" {print $2; exit}')
+  password_auth=$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication" {print $2; exit}')
+  allow_users=$(sshd -T 2>/dev/null | awk '$1=="allowusers" {$1=""; sub(/^ /,""); print; exit}')
+  address_family=$(sshd -T 2>/dev/null | awk '$1=="addressfamily" {print $2; exit}')
+  check_line "PermitRootLogin" "no" "$permit_root" || fail=$((fail + 1))
+  check_line "PasswordAuthentication" "yes" "$password_auth" || fail=$((fail + 1))
+  if grep -q '^IPV6=no$' "$UFW_DEFAULTS_FILE" 2>/dev/null; then
+    [[ "$address_family" == "inet" ]] && say_ok "SSH AddressFamily inet" || { say_fail "SSH AddressFamily expected inet, got $address_family"; fail=$((fail + 1)); }
+  else
+    [[ "$address_family" == "any" ]] && say_ok "SSH AddressFamily any" || { say_warn "SSH AddressFamily is $address_family while IPv6 is enabled"; warn=$((warn + 1)); }
+  fi
+  [[ -n "$allow_users" ]] && say_ok "AllowUsers = $allow_users" || { say_fail "AllowUsers"; fail=$((fail + 1)); }
+
+  if id "${allow_users%% *}" &>/dev/null; then
+    say_ok "SSH user exists: ${allow_users%% *}"
+  else
+    say_fail "SSH user does not exist: ${allow_users%% *}"; fail=$((fail + 1))
+  fi
+
+  root_locked=$(passwd -S root 2>/dev/null | awk '{print $2}')
+  if [[ "$root_locked" == "L" ]]; then say_ok "root password locked"; else say_warn "root password is not locked"; warn=$((warn + 1)); fi
+
+  if sudo -l -U "${allow_users%% *}" 2>/dev/null | grep -Fq '(ALL : ALL) ALL'; then
+    say_ok "sudo access for ${allow_users%% *}"
+  else
+    say_fail "sudo access for ${allow_users%% *}"; fail=$((fail + 1))
+  fi
+
+  local ufw_status
+  ufw_status=$(ufw status 2>/dev/null | head -n1 || true)
+  check_line "UFW active" "Status: active" "$ufw_status" || fail=$((fail + 1))
+  if grep -Fq "$port/tcp" <(ufw status 2>/dev/null) && grep -Fq "LIMIT" <(ufw status 2>/dev/null); then
+    say_ok "UFW rate-limit for SSH $port/tcp"
+  else
+    say_fail "UFW rate-limit for SSH $port/tcp"; fail=$((fail + 1));
+  fi
+
+  if grep -qE '^-A ufw-before-input -p icmp --icmp-type echo-request -j DROP$' "$UFW_BEFORE_FILE" 2>/dev/null; then
+    say_ok "IPv4 ping blocked in UFW"
+  else
+    say_fail "IPv4 ping blocked in UFW"; fail=$((fail + 1));
+  fi
+
+  if systemctl is-enabled fail2ban &>/dev/null && systemctl is-active --quiet fail2ban; then
+    say_ok "Fail2Ban enabled + active"
+  else
+    say_fail "Fail2Ban enabled + active"; fail=$((fail + 1));
+  fi
+
+  local f2b_cfg
+  f2b_cfg=$(cat "$FAIL2BAN_FILE" 2>/dev/null || true)
+  if grep -qF 'maxretry = 3' <<<"$f2b_cfg" && grep -qF 'findtime = 10m' <<<"$f2b_cfg" && grep -qF 'bantime = 24h' <<<"$f2b_cfg" && grep -qF "port = $port" <<<"$f2b_cfg"; then
+    say_ok "Fail2Ban SSH policy"
+  else
+    say_fail "Fail2Ban SSH policy"; fail=$((fail + 1));
+  fi
+
+  local v k expected actual
+  declare -a SYSCTL_CHECKS=(
+    'net.ipv4.conf.all.rp_filter=1'
+    'net.ipv4.conf.default.rp_filter=1'
+    'net.ipv4.conf.all.accept_source_route=0'
+    'net.ipv4.conf.default.accept_source_route=0'
+    'net.ipv4.conf.all.accept_redirects=0'
+    'net.ipv4.conf.default.accept_redirects=0'
+    'net.ipv4.conf.all.secure_redirects=0'
+    'net.ipv4.conf.default.secure_redirects=0'
+    'net.ipv4.conf.all.send_redirects=0'
+    'net.ipv4.conf.default.send_redirects=0'
+    'net.ipv4.icmp_ignore_bogus_error_responses=1'
+    'net.ipv4.icmp_echo_ignore_broadcasts=1'
+    'net.ipv4.conf.all.log_martians=1'
+    'net.ipv4.conf.default.log_martians=1'
+    'kernel.dmesg_restrict=1'
+    'kernel.kptr_restrict=2'
+    'kernel.yama.ptrace_scope=1'
+    'fs.protected_hardlinks=1'
+    'fs.protected_symlinks=1'
+    'fs.suid_dumpable=0'
+    'vm.swappiness=10'
+    'vm.vfs_cache_pressure=50'
+  )
+  for v in "${SYSCTL_CHECKS[@]}"; do
+    k=${v%%=*}; expected=${v#*=}; actual=$(sysctl -n "$k" 2>/dev/null || echo MISSING)
+    if [[ "$actual" == "$expected" ]]; then say_ok "$k=$expected"; else say_fail "$k expected $expected, got $actual"; fail=$((fail + 1)); fi
+  done
+
+  if grep -qF 'net.core.default_qdisc = fq' "$SYSCTL_FILE" 2>/dev/null; then
+    actual=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo MISSING)
+    [[ "$actual" == fq ]] && say_ok "BBR qdisc fq" || { say_fail "BBR qdisc fq (got $actual)"; fail=$((fail + 1)); }
+  fi
+  if grep -qF 'net.ipv4.tcp_congestion_control = bbr' "$SYSCTL_FILE" 2>/dev/null; then
+    actual=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo MISSING)
+    [[ "$actual" == bbr ]] && say_ok "TCP congestion control bbr" || { say_fail "TCP congestion control bbr (got $actual)"; fail=$((fail + 1)); }
+  fi
+
+  if grep -q '^IPV6=no$' "$UFW_DEFAULTS_FILE" 2>/dev/null; then
+    local ipv6_all ipv6_default ipv6_bad
+    ipv6_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo MISSING)
+    ipv6_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo MISSING)
+    ipv6_bad=0
+    while read -r key value; do
+      [[ "$key" == net.ipv6.conf.*.disable_ipv6 ]] || continue
+      [[ "$value" == 1 ]] || ipv6_bad=1
+    done < <(sysctl -a 2>/dev/null | grep '^net.ipv6.conf\..*\.disable_ipv6 = ' || true)
+    if [[ "$ipv6_all" == 1 && "$ipv6_default" == 1 && "$ipv6_bad" == 0 ]] && ! ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+      say_ok "IPv6 disabled at sysctl + UFW"
     else
-        log_warn "Не удалось установить часовой пояс '$new_tz'. Проверьте правильность."
+      say_fail "IPv6 disable requested but runtime/interface state is not fully disabled"; fail=$((fail + 1));
     fi
-else
-    log_info "Часовой пояс оставлен без изменений."
-fi
+  fi
 
-log_step "Шаг 10.5: Отключение ненужных сервисов"
-for svc in snapd cups; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-        systemctl disable --now "$svc" 2>/dev/null || true
-        log_info "Сервис $svc отключен."
-    fi
-done
+  if swapon --show 2>/dev/null | awk 'NR>1 {print}' | grep -q .; then say_ok "Swap active"; else say_warn "Swap inactive"; warn=$((warn + 1)); fi
 
-log_step "Шаг 11: Отключение учетной записи root"
-root_status=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
-if [ "$root_status" != "L" ]; then
-    read -p "Отключить учетную запись root? (yes/no): " confirm
-    if [[ "$confirm" == "yes" ]]; then
-        passwd -l root
-        log_info "Учетная запись root отключена."
-    fi
-else
-    log_info "Учетная запись root уже отключена."
-fi
+  if dpkg-query -W -f='${Status}\n' unattended-upgrades 2>/dev/null | grep -q 'install ok installed'; then say_ok "unattended-upgrades installed"; else say_fail "unattended-upgrades installed"; fail=$((fail + 1)); fi
 
-echo ""
-echo "========================================================"
-log_info "НАСТРОЙКА ЗАВЕРШЕНА."
-echo "--------------------------------------------------------"
-echo -e "User: ${YELLOW}$new_user${NC}"
-echo -e "Port: ${YELLOW}$sshport${NC}"
-echo -e "Вход: ${YELLOW}по паролю${NC}"
-echo "--------------------------------------------------------"
-log_warn "ПРОВЕРЬТЕ ДОСТУП, НЕ ЗАКРЫВАЯ ТЕКУЩУЮ СЕССИЮ!"
-echo ""
-echo -e "Откройте ${YELLOW}ВТОРУЮ${NC} SSH-сессию и подключитесь:"
-echo -e "  ${GREEN}ssh -p $sshport $new_user@<IP>${NC}"
-echo ""
-echo -e "Убедитесь, что:"
-echo -e "  1. Подключение по паролю успешно"
-echo -e "  2. ${YELLOW}sudo whoami${NC} возвращает ${GREEN}root${NC}"
-echo "--------------------------------------------------------"
-read -p "Подключение во второй сессии успешно? (yes/no): " access_ok
+  local pending
+  pending=$(apt-get -s upgrade 2>/dev/null | awk '/^[0-9]+ upgraded/ {print $1; exit}')
+  [[ "${pending:-0}" == 0 ]] && say_ok "No pending apt upgrades" || { say_warn "Pending apt upgrades: ${pending:-unknown}"; warn=$((warn + 1)); }
 
-if [[ "$access_ok" != "yes" ]]; then
-    log_warn "Разберитесь с доступом прежде чем закрывать текущую сессию."
-    log_warn "Проверьте конфигурацию: $CONFIG_FILE"
-    echo "========================================================"
-    log_info "Лог-файл сохранен: $LOG_FILE"
+  if [[ -n "${INSTALL_CHRONY:-}" && "${INSTALL_CHRONY}" =~ ^[Yy]$ ]] || systemctl cat chrony.service &>/dev/null; then
+    if systemctl is-active --quiet chrony; then say_ok "Chrony active"; else say_warn "Chrony installed but inactive"; warn=$((warn + 1)); fi
+  fi
+
+  if systemctl list-units --state=failed --no-legend | grep -q .; then
+    say_fail "Failed systemd units present"; fail=$((fail + 1));
+  else
+    say_ok "No failed systemd units"
+  fi
+
+  if systemctl is-active --quiet snapd 2>/dev/null; then say_warn "snapd is active"; warn=$((warn + 1)); else say_ok "snapd not active"; fi
+
+  echo
+  echo "============================================================"
+  if (( fail == 0 )); then
+    echo -e "${GREEN}AUDIT PASS${NC} — failures: 0, warnings: ${warn}"
+    return 0
+  else
+    echo -e "${RED}AUDIT FAIL${NC} — failures: ${fail}, warnings: ${warn}"
+    return 1
+  fi
+}
+
+main_setup() {
+  require_root
+  setup_runtime
+  check_supported_os
+  install_base_packages
+  configure_unattended_upgrades
+  create_or_select_user
+  choose_ssh_port
+  ask_options
+  show_plan
+
+  local confirm
+  read -r -p "Продолжить? (y/n, default y): " confirm
+  confirm=${confirm:-y}
+  [[ "$confirm" =~ ^[Yy]$ ]] || { log_warn "Отменено."; exit 0; }
+
+  local old_ssh_port
+  old_ssh_port=$(get_current_ssh_port)
+
+  configure_ufw
+  configure_ssh
+  configure_icmp
+  configure_ipv6
+  write_sysctl_config
+  configure_fail2ban
+  configure_swap
+  configure_bbr
+  configure_chrony
+  configure_docker
+  configure_host
+  configure_optional_services
+  create_logrotate
+
+  cleanup_old_ssh_ufw_rule "$old_ssh_port"
+
+  if ! validate_access_before_root_lock; then
+    echo
+    log_warn "Настройка завершена, но root account оставлен разблокированным."
+    log_info "После проверки доступа запустите: sudo bash setup.sh --audit"
     exit 0
-fi
+  fi
 
-echo "========================================================"
-log_info "НАСТРОЙКА ПОЛНОСТЬЮ ЗАВЕРШЕНА."
-log_info "Лог-файл сохранен: $LOG_FILE"
-if [ -f /var/run/reboot-required ]; then
-    echo ""
-    log_warn "РЕКОМЕНДУЕТСЯ ПЕРЕЗАГРУЗКА: обновлено ядро."
-    log_warn "Выполните: sudo reboot"
-fi
+  lock_root
+  post_setup_checks
+
+  echo
+  echo "============================================================"
+  log_info "UIS ${VERSION} ЗАВЕРШЁН"
+  echo "User: ${TARGET_USER}"
+  echo "Port: ${SSH_PORT}"
+  echo "Log:  ${LOG_FILE}"
+  echo "============================================================"
+  log_warn "Рекомендуется один раз выполнить reboot и затем повторить audit:"
+  echo "  sudo reboot"
+  echo "  sudo bash setup.sh --audit"
+}
+
+main_audit() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    log_err "Audit должен запускаться от root: sudo bash setup.sh --audit"
+    exit 1
+  fi
+  setup_runtime
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+  fi
+  trap - ERR
+  run_audit
+  local rc=$?
+  exit "$rc"
+}
+
+case "${1:-}" in
+  --audit|-a)
+    main_audit
+    ;;
+  --help|-h)
+    usage
+    ;;
+  --version|-v)
+    echo "$VERSION"
+    ;;
+  "")
+    main_setup
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
