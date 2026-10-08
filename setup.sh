@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 
-VERSION="2.0.4"
+VERSION="2.0.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -131,7 +131,6 @@ check_supported_os() {
     log_err "Не найден /etc/os-release."
     exit 1
   fi
-  # shellcheck disable=SC1091
   source /etc/os-release
   OS_ID="${ID:-unknown}"
   OS_VERSION="${VERSION_ID:-0}"
@@ -435,7 +434,7 @@ EOF2
   fi
 
   write_atomic "$SYSCTL_FILE" 644 <<EOF2
-${IPV6_LINES}
+ ${IPV6_LINES}
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_source_route = 0
@@ -481,7 +480,9 @@ install_sysctl_reapply_service() {
 #!/usr/bin/env bash
 set -u
 
-/usr/sbin/sysctl --load=/etc/sysctl.d/99-uis-hardening.conf >/dev/null 2>&1 || true
+if ! /usr/sbin/sysctl --load=/etc/sysctl.d/99-uis-hardening.conf; then
+  echo "uis-apply-sysctl: failed to load /etc/sysctl.d/99-uis-hardening.conf" | systemd-cat -p err -t uis-sysctl
+fi
 
 if grep -q '^IPV6=no$' /etc/default/ufw 2>/dev/null; then
   for file in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
@@ -876,7 +877,7 @@ run_audit() {
     while read -r key value; do
       [[ "$key" == net.ipv6.conf.*.disable_ipv6 ]] || continue
       [[ "$value" == 1 ]] || ipv6_bad=1
-    done < <(sysctl -a 2>/dev/null | grep '^net.ipv6.conf\..*\.disable_ipv6 = ' || true)
+    done < <(sysctl -a 2>/dev/null | awk '/^net\.ipv6\.conf\..*\.disable_ipv6/ {print $1, $NF}' || true)
     local ipv6_global
     ipv6_global=$(ip -6 addr show scope global 2>/dev/null || true)
     if [[ "$ipv6_all" == 1 && "$ipv6_default" == 1 && "$ipv6_bad" == 0 ]] && ! grep -q 'inet6' <<<"$ipv6_global"; then
@@ -987,7 +988,6 @@ main_audit() {
   fi
   setup_runtime
   if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
     source /etc/os-release
   fi
   trap - ERR
