@@ -2,7 +2,8 @@
 
 set -Eeuo pipefail
 
-VERSION="2.0.3"
+
+VERSION="2.0.4"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -236,7 +237,9 @@ choose_ssh_port() {
       log_warn "Используйте порт 1024-65535."
       continue
     fi
-    if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq ":${SSH_PORT}$|\.${SSH_PORT}$"; then
+    local listening_ports
+    listening_ports=$(ss -H -lnt 2>/dev/null || true)
+    if awk -v p="$SSH_PORT" '$4 ~ (":" p "$") {found=1} END {exit !found}' <<<"$listening_ports"; then
       if [[ "$SSH_PORT" != "$current_port" ]]; then
         log_warn "Порт $SSH_PORT уже занят."
         continue
@@ -288,13 +291,15 @@ configure_ufw() {
   ufw default deny incoming >/dev/null
   ufw default allow outgoing >/dev/null
 
-  if ! ufw status 2>/dev/null | grep -Eq "${SSH_PORT}/tcp[[:space:]]+LIMIT"; then
+  local ufw_status
+  ufw_status=$(ufw status 2>/dev/null || true)
+  if ! grep -Eq "${SSH_PORT}/tcp[[:space:]]+LIMIT" <<<"$ufw_status"; then
     ufw delete allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
     ufw delete "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
     ufw limit "${SSH_PORT}/tcp" >/dev/null
   fi
 
-  if [[ "$(ufw status | head -n1)" == "Status: inactive" ]]; then
+  if [[ "$(ufw status 2>/dev/null || true)" == "Status: inactive"* ]]; then
     echo 'y' | ufw enable >/dev/null
   fi
 
@@ -320,7 +325,6 @@ configure_ssh() {
   fi
 
   write_atomic "$SSH_HARDENING_FILE" 644 <<EOF2
-# Managed by UIS ${VERSION}
 Port ${SSH_PORT}
 PermitRootLogin no
 PasswordAuthentication yes
@@ -431,7 +435,6 @@ EOF2
   fi
 
   write_atomic "$SYSCTL_FILE" 644 <<EOF2
-# Managed by UIS ${VERSION}
 ${IPV6_LINES}
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
@@ -534,7 +537,9 @@ configure_swap() {
   [[ "$CREATE_SWAP" =~ ^[Yy]$ ]] || return 0
   log_step "12. Swap"
 
-  if swapon --show | awk 'NR>1 {print $1}' | grep -q .; then
+  local swap_status
+  swap_status=$(swapon --show 2>/dev/null || true)
+  if [[ -n "$(awk 'NR>1 {print $1}' <<<"$swap_status")" ]]; then
     log_info "Swap уже активен."
     return
   fi
@@ -564,12 +569,13 @@ configure_bbr() {
   [[ "$ENABLE_BBR" =~ ^[Yy]$ ]] || return 0
   log_step "13. BBR"
 
-  if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx bbr; then
-    modprobe tcp_bbr 2>/dev/null || true
-  fi
-
   local available
   available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  if ! grep -Eq '(^|[[:space:]])bbr([[:space:]]|$)' <<<"$available"; then
+    modprobe tcp_bbr 2>/dev/null || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  fi
+
   if ! grep -qw bbr <<<"$available"; then
     log_warn "BBR недоступен в этом kernel."
     return 0
@@ -620,7 +626,9 @@ configure_host() {
   fi
 
   if [[ -n "${NEW_TIMEZONE}" ]]; then
-    if timedatectl list-timezones | grep -Fxq "$NEW_TIMEZONE"; then
+    local timezones
+    timezones=$(timedatectl list-timezones 2>/dev/null || true)
+    if grep -Fxq "$NEW_TIMEZONE" <<<"$timezones"; then
       timedatectl set-timezone "$NEW_TIMEZONE"
       log_info "Timezone: $NEW_TIMEZONE"
     else
@@ -650,7 +658,9 @@ configure_optional_services() {
 validate_access_before_root_lock() {
   log_step "18. Проверка доступа"
   local listening
-  listening=$(ss -H -lnt | awk '{print $4}' | grep -E "(:|\\.)${SSH_PORT}$" || true)
+  local socket_table
+  socket_table=$(ss -H -lnt 2>/dev/null || true)
+  listening=$(awk -v p="$SSH_PORT" '$4 ~ (":" p "$|\\." p "$") {print $4}' <<<"$socket_table")
   if [[ -z "$listening" ]]; then
     log_err "Новый SSH порт $SSH_PORT не слушается. Root не будет блокироваться."
     exit 1
@@ -693,7 +703,9 @@ cleanup_old_ssh_ufw_rule() {
   [[ -n "$old_port" && "$old_port" =~ ^[0-9]+$ ]] || return 0
   [[ "$old_port" == "$SSH_PORT" ]] && return 0
 
-  if ufw status | grep -Eq "${old_port}/tcp.*ALLOW|${old_port}/tcp.*LIMIT"; then
+  local ufw_rules
+  ufw_rules=$(ufw status 2>/dev/null || true)
+  if grep -Eq "${old_port}/tcp.*ALLOW|${old_port}/tcp.*LIMIT" <<<"$ufw_rules"; then
     log_warn "Найден старый UFW SSH rule на $old_port. Он НЕ удаляется автоматически."
     log_warn "После дополнительной проверки можно удалить: sudo ufw delete limit ${old_port}/tcp"
   fi
@@ -748,7 +760,9 @@ run_audit() {
   echo
 
   if sshd -t 2>/dev/null; then say_ok "sshd -t"; else say_fail "sshd -t"; fail=$((fail + 1)); fi
-  if [[ "$port" =~ ^[0-9]+$ ]] && ss -H -lnt | awk '{print $4}' | grep -Eq "(:|\\.)${port}$"; then
+  local socket_table
+  socket_table=$(ss -H -lnt 2>/dev/null || true)
+  if [[ "$port" =~ ^[0-9]+$ ]] && awk -v p="$port" '$4 ~ (":" p "$|\\." p "$") {found=1} END {exit !found}' <<<"$socket_table"; then
     say_ok "SSH listening on ${port}"
   else
     say_fail "SSH listening on configured port ${port:-unknown}"; fail=$((fail + 1))
@@ -777,14 +791,17 @@ run_audit() {
   root_locked=$(passwd -S root 2>/dev/null | awk '{print $2}')
   if [[ "$root_locked" == "L" ]]; then say_ok "root password locked"; else say_warn "root password is not locked"; warn=$((warn + 1)); fi
 
-  if sudo -l -U "${allow_users%% *}" 2>/dev/null | grep -Fq '(ALL : ALL) ALL'; then
+  local sudo_rules
+  sudo_rules=$(sudo -l -U "${allow_users%% *}" 2>/dev/null || true)
+  if grep -Fq '(ALL : ALL) ALL' <<<"$sudo_rules"; then
     say_ok "sudo access for ${allow_users%% *}"
   else
     say_fail "sudo access for ${allow_users%% *}"; fail=$((fail + 1))
   fi
 
   local ufw_status
-  ufw_status=$(ufw status 2>/dev/null | head -n1 || true)
+  ufw_status=$(ufw status 2>/dev/null || true)
+  ufw_status=${ufw_status%%$'\n'*}
   check_line "UFW active" "Status: active" "$ufw_status" || fail=$((fail + 1))
   if grep -Fq "$port/tcp" <(ufw status 2>/dev/null) && grep -Fq "LIMIT" <(ufw status 2>/dev/null); then
     say_ok "UFW rate-limit for SSH $port/tcp"
@@ -860,16 +877,22 @@ run_audit() {
       [[ "$key" == net.ipv6.conf.*.disable_ipv6 ]] || continue
       [[ "$value" == 1 ]] || ipv6_bad=1
     done < <(sysctl -a 2>/dev/null | grep '^net.ipv6.conf\..*\.disable_ipv6 = ' || true)
-    if [[ "$ipv6_all" == 1 && "$ipv6_default" == 1 && "$ipv6_bad" == 0 ]] && ! ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+    local ipv6_global
+    ipv6_global=$(ip -6 addr show scope global 2>/dev/null || true)
+    if [[ "$ipv6_all" == 1 && "$ipv6_default" == 1 && "$ipv6_bad" == 0 ]] && ! grep -q 'inet6' <<<"$ipv6_global"; then
       say_ok "IPv6 disabled at sysctl + UFW"
     else
       say_fail "IPv6 disable requested but runtime/interface state is not fully disabled"; fail=$((fail + 1));
     fi
   fi
 
-  if swapon --show 2>/dev/null | awk 'NR>1 {print}' | grep -q .; then say_ok "Swap active"; else say_warn "Swap inactive"; warn=$((warn + 1)); fi
+  local swap_lines
+  swap_lines=$(swapon --show 2>/dev/null || true)
+  if [[ -n "$(awk 'NR>1 {print}' <<<"$swap_lines")" ]]; then say_ok "Swap active"; else say_warn "Swap inactive"; warn=$((warn + 1)); fi
 
-  if dpkg-query -W -f='${Status}\n' unattended-upgrades 2>/dev/null | grep -q 'install ok installed'; then say_ok "unattended-upgrades installed"; else say_fail "unattended-upgrades installed"; fail=$((fail + 1)); fi
+  local uu_status
+  uu_status=$(dpkg-query -W -f='${Status}\n' unattended-upgrades 2>/dev/null || true)
+  if grep -q 'install ok installed' <<<"$uu_status"; then say_ok "unattended-upgrades installed"; else say_fail "unattended-upgrades installed"; fail=$((fail + 1)); fi
 
   local pending
   pending=$(apt-get -s upgrade 2>/dev/null | awk '/^[0-9]+ upgraded/ && !found {print $1; found=1}' )
@@ -879,7 +902,9 @@ run_audit() {
     if systemctl is-active --quiet chrony; then say_ok "Chrony active"; else say_warn "Chrony installed but inactive"; warn=$((warn + 1)); fi
   fi
 
-  if systemctl list-units --state=failed --no-legend | grep -q .; then
+  local failed_units
+  failed_units=$(systemctl list-units --state=failed --no-legend 2>/dev/null || true)
+  if [[ -n "$failed_units" ]]; then
     say_fail "Failed systemd units present"; fail=$((fail + 1));
   else
     say_ok "No failed systemd units"
