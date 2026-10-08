@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-VERSION="2.0.2"
+VERSION="2.0.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,6 +37,7 @@ on_error() {
   local rc=$?
   local line=${1:-unknown}
   log_err "Ошибка на строке ${line} (exit ${rc})."
+  log_err "Команда: ${BASH_COMMAND}"
   log_err "Лог: ${LOG_FILE}"
   exit "$rc"
 }
@@ -212,8 +213,9 @@ create_or_select_user() {
 }
 
 get_current_ssh_port() {
-  local p
-  p=$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}') || true
+  local config p
+  config=$(sshd -T 2>/dev/null || true)
+  p=$(awk '$1=="port" {print $2; exit}' <<<"$config")
   if [[ "$p" =~ ^[0-9]+$ ]]; then
     printf '%s' "$p"
   else
@@ -358,10 +360,14 @@ EOF2
     systemctl restart ssh.service
   fi
 
-  local effective_port effective_user root_login
-  effective_port=$(sshd -T | awk '$1=="port" {print $2; exit}')
-  effective_user=$(sshd -T | awk '$1=="allowusers" {$1=""; sub(/^ /,""); print; exit}')
-  root_login=$(sshd -T | awk '$1=="permitrootlogin" {print $2; exit}')
+  local sshd_effective effective_port effective_user root_login
+  if ! sshd_effective=$(sshd -T 2>/dev/null); then
+    log_err "Не удалось получить эффективную конфигурацию sshd."
+    exit 1
+  fi
+  effective_port=$(awk '$1=="port" {print $2; exit}' <<<"$sshd_effective")
+  effective_user=$(awk '$1=="allowusers" {$1=""; sub(/^ /,""); print; exit}' <<<"$sshd_effective")
+  root_login=$(awk '$1=="permitrootlogin" {print $2; exit}' <<<"$sshd_effective")
 
   [[ "$effective_port" == "$SSH_PORT" ]] || { log_err "sshd слушает не тот порт: $effective_port"; exit 1; }
   [[ "$effective_user" == "$TARGET_USER" ]] || { log_err "AllowUsers не совпадает: $effective_user"; exit 1; }
@@ -729,8 +735,9 @@ check_line() {
 run_audit() {
   local fail=0
   local warn=0
-  local port root_locked
-  port=$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}' || true)
+  local port root_locked sshd_effective
+  sshd_effective=$(sshd -T 2>/dev/null || true)
+  port=$(awk '$1=="port" {print $2; exit}' <<<"$sshd_effective")
 
   echo
   echo "============================================================"
@@ -748,10 +755,10 @@ run_audit() {
   fi
 
   local permit_root password_auth allow_users address_family
-  permit_root=$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin" {print $2; exit}')
-  password_auth=$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication" {print $2; exit}')
-  allow_users=$(sshd -T 2>/dev/null | awk '$1=="allowusers" {$1=""; sub(/^ /,""); print; exit}')
-  address_family=$(sshd -T 2>/dev/null | awk '$1=="addressfamily" {print $2; exit}')
+  permit_root=$(awk '$1=="permitrootlogin" {print $2; exit}' <<<"$sshd_effective")
+  password_auth=$(awk '$1=="passwordauthentication" {print $2; exit}' <<<"$sshd_effective")
+  allow_users=$(awk '$1=="allowusers" {$1=""; sub(/^ /,""); print; exit}' <<<"$sshd_effective")
+  address_family=$(awk '$1=="addressfamily" {print $2; exit}' <<<"$sshd_effective")
   check_line "PermitRootLogin" "no" "$permit_root" || fail=$((fail + 1))
   check_line "PasswordAuthentication" "yes" "$password_auth" || fail=$((fail + 1))
   if grep -q '^IPV6=no$' "$UFW_DEFAULTS_FILE" 2>/dev/null; then
@@ -865,7 +872,7 @@ run_audit() {
   if dpkg-query -W -f='${Status}\n' unattended-upgrades 2>/dev/null | grep -q 'install ok installed'; then say_ok "unattended-upgrades installed"; else say_fail "unattended-upgrades installed"; fail=$((fail + 1)); fi
 
   local pending
-  pending=$(apt-get -s upgrade 2>/dev/null | awk '/^[0-9]+ upgraded/ {print $1; exit}')
+  pending=$(apt-get -s upgrade 2>/dev/null | awk '/^[0-9]+ upgraded/ && !found {print $1; found=1}' )
   [[ "${pending:-0}" == 0 ]] && say_ok "No pending apt upgrades" || { say_warn "Pending apt upgrades: ${pending:-unknown}"; warn=$((warn + 1)); }
 
   if [[ -n "${INSTALL_CHRONY:-}" && "${INSTALL_CHRONY}" =~ ^[Yy]$ ]] || systemctl cat chrony.service &>/dev/null; then
