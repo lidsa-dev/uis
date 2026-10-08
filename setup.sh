@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-VERSION="2.0.1"
+VERSION="2.0.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -338,6 +338,8 @@ ClientAliveCountMax 2
 LogLevel VERBOSE
 UseDNS no
 EOF2
+
+  install -d -m 0755 -o root -g root /run/sshd
 
   if ! sshd -t; then
     log_err "sshd -t провалился. Старый SSH-конфиг не должен быть потерян."
